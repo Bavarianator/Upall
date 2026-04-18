@@ -1,0 +1,1427 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# UPALL v1.0.0 - Universal Linux Updater
+# Automatisches Update-Script fuer alle grossen Linux-Distributionen
+# ==============================================================================
+# INSTALLATION:
+#   nano ~/UPALL
+#   chmod +x ~/UPALL
+#   sudo mv ~/UPALL /usr/local/bin/UPALL
+#   UPALL --setup
+# ==============================================================================
+# NUTZUNG:
+#   UPALL              Normales Update
+#   UPALL --nerd       Interaktiver Nerd Mode
+#   UPALL --setup      Ersteinrichtung
+#   UPALL --dry-run    Simulation ohne Aenderungen
+#   UPALL --quiet      Stille Ausfuehrung
+#   UPALL --force      Keine Rueckfragen
+#   UPALL --info       Systeminformationen
+#   UPALL --version    Versionsinformation
+#   UPALL --help       Hilfe anzeigen
+# ==============================================================================
+
+set -uo pipefail
+IFS=$'\n\t'
+
+# ------------------------------------------------------------------------------
+# KONSTANTEN
+# ------------------------------------------------------------------------------
+readonly SCRIPT_NAME="UPALL"
+readonly SCRIPT_VERSION="1.0.0"
+readonly CONFIG_DIR="${HOME}/.config/UPALL"
+readonly CONFIG_FILE="${CONFIG_DIR}/config"
+readonly LOG_DIR="${HOME}/.local/share/UPALL/logs"
+readonly LOG_FILE="${LOG_DIR}/upall_$(date +%Y%m%d_%H%M%S).log"
+readonly LOCK_FILE="/tmp/UPALL.lock"
+
+# ------------------------------------------------------------------------------
+# LAUFZEIT-VARIABLEN
+# ------------------------------------------------------------------------------
+DISTRO_NAME=""
+DISTRO_ID=""
+DISTRO_VERSION=""
+PACKAGE_MANAGER=""
+NERD_MODE=false
+SETUP_MODE=false
+DRY_RUN=false
+FORCE_MODE=false
+QUIET_MODE=false
+SHOW_INFO=false
+
+# Konfiguration Standardwerte
+UPDATE_KERNEL=true
+AUTO_CLEANUP=true
+SECURITY_ONLY=false
+BACKUP_BEFORE_UPDATE=false
+LOG_LEVEL="normal"
+UPDATE_FLATPAK=true
+UPDATE_SNAP=true
+UPDATE_FIRMWARE=false
+AUTOREMOVE=true
+CLEAN_CACHE=true
+REBOOT_AFTER=false
+DEBIAN_DIST_UPGRADE=true
+ARCH_AUR_HELPER="paru"
+FEDORA_ALLOW_DOWNGRADE=false
+GENTOO_JOBS=2
+OPENSUSE_DIST_UPGRADE=false
+
+# Zaehler
+STEPS_TOTAL=0
+STEPS_CURRENT=0
+ERRORS_COUNT=0
+WARNINGS_COUNT=0
+START_TIME=""
+
+# ==============================================================================
+# FARBEN
+# ==============================================================================
+
+setup_colors() {
+    if [[ -t 1 ]] && [[ "${TERM:-dumb}" != "dumb" ]]; then
+        C_RESET="\033[0m"
+        C_RED="\033[0;31m"
+        C_GREEN="\033[0;32m"
+        C_YELLOW="\033[0;33m"
+        C_BLUE="\033[0;34m"
+        C_CYAN="\033[0;36m"
+        C_WHITE="\033[1;37m"
+        C_BOLD="\033[1m"
+    else
+        C_RESET="" C_RED="" C_GREEN="" C_YELLOW=""
+        C_BLUE="" C_CYAN="" C_WHITE="" C_BOLD=""
+    fi
+}
+
+# ==============================================================================
+# AUSGABE
+# ==============================================================================
+
+_out() {
+    local level="$1" msg="$2" color="$3"
+    local ts
+    ts=$(date "+%H:%M:%S")
+    local formatted="[${SCRIPT_NAME}] [${level}] ${msg}"
+
+    if [[ "${QUIET_MODE}" == "false" ]] || [[ "${level}" == "ERROR" ]]; then
+        echo -e "${color}${formatted}${C_RESET}"
+    fi
+
+    if [[ -d "${LOG_DIR}" ]]; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') ${formatted}" >> "${LOG_FILE}" 2>/dev/null || true
+    fi
+}
+
+log_info()    { _out "INFO"  "$1" "${C_CYAN}"; }
+log_ok()      { _out "OK"    "$1" "${C_GREEN}"; }
+log_warn()    { _out "WARN"  "$1" "${C_YELLOW}"; (( WARNINGS_COUNT++ )) || true; }
+log_error()   { _out "ERROR" "$1" "${C_RED}" >&2; (( ERRORS_COUNT++ )) || true; }
+log_verbose() { [[ "${LOG_LEVEL}" == "verbose" ]] && _out "DEBUG" "$1" "${C_BLUE}" || true; }
+
+log_step() {
+    (( STEPS_CURRENT++ )) || true
+    _out "SCHRITT ${STEPS_CURRENT}/${STEPS_TOTAL}" "$1" "${C_BOLD}${C_WHITE}"
+}
+
+log_upall() {
+    _out "SYSTEM" "$1" "${C_WHITE}"
+}
+
+print_sep() {
+    local c="${1:--}" w="${2:-70}"
+    if [[ "${QUIET_MODE}" == "false" ]]; then
+        printf '%*s\n' "${w}" '' | tr ' ' "${c}"
+    fi
+}
+
+print_header() {
+    [[ "${QUIET_MODE}" == "true" ]] && return
+    echo ""
+    print_sep "="
+    echo -e "${C_BOLD}${C_WHITE}  ${SCRIPT_NAME} v${SCRIPT_VERSION} - Universal Linux Updater${C_RESET}"
+    print_sep "="
+    echo ""
+}
+
+# ==============================================================================
+# HILFSFUNKTIONEN
+# ==============================================================================
+
+cmd_exists() { command -v "$1" &>/dev/null; }
+
+is_root() { [[ "${EUID:-$(id -u)}" -eq 0 ]]; }
+
+run_root() {
+    if is_root; then
+        "$@"
+    elif cmd_exists sudo; then
+        sudo "$@"
+    else
+        log_error "Root-Rechte erforderlich, sudo nicht verfuegbar."
+        return 1
+    fi
+}
+
+ask_yn() {
+    local q="$1" def="${2:-n}"
+    [[ "${FORCE_MODE}" == "true" ]] && return 0
+
+    local prompt
+    [[ "${def}" == "y" ]] && prompt="[J/n]" || prompt="[j/N]"
+
+    while true; do
+        echo -ne "${C_YELLOW}[${SCRIPT_NAME}] ${q} ${prompt}: ${C_RESET}"
+        read -r ans
+        ans="${ans,,}"
+        case "${ans}" in
+            j|ja|y|yes) return 0 ;;
+            n|nein|no)  return 1 ;;
+            "") [[ "${def}" == "y" ]] && return 0 || return 1 ;;
+            *) echo "  Bitte 'j' oder 'n' eingeben." ;;
+        esac
+    done
+}
+
+run_cmd() {
+    local desc="$1"; shift
+
+    log_verbose "Ausfuehren: $*"
+
+    if [[ "${DRY_RUN}" == "true" ]]; then
+        log_info "[DRY-RUN] ${desc}: $*"
+        return 0
+    fi
+
+    if "$@"; then
+        log_verbose "${desc} erfolgreich."
+        return 0
+    else
+        log_warn "${desc} fehlgeschlagen (Exit: $?)."
+        return 1
+    fi
+}
+
+acquire_lock() {
+    if [[ -f "${LOCK_FILE}" ]]; then
+        local pid
+        pid=$(cat "${LOCK_FILE}" 2>/dev/null || echo "")
+        if [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then
+            log_error "UPALL laeuft bereits (PID: ${pid})."
+            exit 1
+        fi
+        rm -f "${LOCK_FILE}"
+    fi
+    echo "$$" > "${LOCK_FILE}"
+}
+
+release_lock() { rm -f "${LOCK_FILE}" 2>/dev/null || true; }
+
+cleanup_exit() {
+    release_lock
+    if [[ -n "${START_TIME:-}" ]]; then
+        local end_time duration
+        end_time=$(date +%s)
+        duration=$(( end_time - START_TIME ))
+        log_verbose "Laufzeit: ${duration} Sekunden"
+    fi
+}
+
+setup_traps() {
+    trap 'cleanup_exit' EXIT
+    trap 'echo ""; log_warn "Abgebrochen durch Benutzer."; exit 130' INT
+    trap 'log_warn "SIGTERM empfangen."; exit 143' TERM
+}
+
+# ==============================================================================
+# LOGGING-SETUP
+# ==============================================================================
+
+setup_logging() {
+    mkdir -p "${LOG_DIR}" 2>/dev/null || {
+        log_warn "Log-Verzeichnis nicht erstellbar."
+        return
+    }
+
+    find "${LOG_DIR}" -name "upall_*.log" -mtime +30 -delete 2>/dev/null || true
+
+    {
+        echo "======================================"
+        echo "UPALL Log - $(date)"
+        echo "Version: ${SCRIPT_VERSION}"
+        echo "User: $(whoami) | Host: $(hostname)"
+        echo "======================================"
+    } >> "${LOG_FILE}" 2>/dev/null || true
+}
+
+# ==============================================================================
+# KONFIGURATION
+# ==============================================================================
+
+ensure_config_dir() {
+    mkdir -p "${CONFIG_DIR}" 2>/dev/null || {
+        log_warn "Config-Verzeichnis nicht erstellbar."
+        return 1
+    }
+}
+
+write_default_config() {
+    ensure_config_dir || return 1
+    cat > "${CONFIG_FILE}" << 'KONFIG_ENDE'
+# =============================================
+# UPALL Konfigurationsdatei
+# Bearbeiten: nano ~/.config/UPALL/config
+# =============================================
+
+# Kernel-Updates einschliessen
+UPDATE_KERNEL=true
+
+# Nur Sicherheitsupdates
+SECURITY_ONLY=false
+
+# Flatpak aktualisieren
+UPDATE_FLATPAK=true
+
+# Snap aktualisieren
+UPDATE_SNAP=true
+
+# Firmware-Updates (fwupd)
+UPDATE_FIRMWARE=false
+
+# Alte Pakete entfernen
+AUTOREMOVE=true
+
+# Paket-Cache bereinigen
+CLEAN_CACHE=true
+
+# Backup vor Update (erfordert rsync)
+BACKUP_BEFORE_UPDATE=false
+
+# Log-Level: verbose / normal / quiet
+LOG_LEVEL=normal
+
+# Auto-Reboot nach Update
+REBOOT_AFTER=false
+
+# --- Debian/Ubuntu ---
+DEBIAN_DIST_UPGRADE=true
+
+# --- Arch ---
+# AUR-Helper: paru / yay / none
+ARCH_AUR_HELPER=paru
+
+# --- Fedora ---
+FEDORA_ALLOW_DOWNGRADE=false
+
+# --- Gentoo ---
+GENTOO_JOBS=2
+
+# --- openSUSE ---
+OPENSUSE_DIST_UPGRADE=false
+KONFIG_ENDE
+
+    log_ok "Konfiguration erstellt: ${CONFIG_FILE}"
+}
+
+load_config() {
+    [[ ! -f "${CONFIG_FILE}" ]] && return
+
+    local valid_vars=(
+        UPDATE_KERNEL SECURITY_ONLY UPDATE_FLATPAK UPDATE_SNAP
+        UPDATE_FIRMWARE AUTOREMOVE CLEAN_CACHE BACKUP_BEFORE_UPDATE
+        LOG_LEVEL REBOOT_AFTER DEBIAN_DIST_UPGRADE ARCH_AUR_HELPER
+        FEDORA_ALLOW_DOWNGRADE GENTOO_JOBS OPENSUSE_DIST_UPGRADE
+    )
+
+    while IFS='=' read -r key value; do
+        [[ "${key}" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "${key// }" ]] && continue
+        key="${key// /}"
+        value="${value//\"/}"
+        value="${value//\'/}"
+        value="${value%%#*}"
+        value="${value// /}"
+
+        for var in "${valid_vars[@]}"; do
+            if [[ "${key}" == "${var}" ]]; then
+                printf -v "${var}" '%s' "${value}"
+                log_verbose "Config: ${var}=${value}"
+                break
+            fi
+        done
+    done < "${CONFIG_FILE}"
+}
+
+update_config_value() {
+    local key="$1" val="$2"
+    [[ ! -f "${CONFIG_FILE}" ]] && return
+
+    if grep -q "^${key}=" "${CONFIG_FILE}" 2>/dev/null; then
+        sed -i "s|^${key}=.*|${key}=${val}|" "${CONFIG_FILE}"
+    else
+        echo "${key}=${val}" >> "${CONFIG_FILE}"
+    fi
+}
+
+toggle_var() {
+    local varname="$1"
+    local current="${!varname}"
+    if [[ "${current}" == "true" ]]; then
+        printf -v "${varname}" '%s' "false"
+    else
+        printf -v "${varname}" '%s' "true"
+    fi
+    update_config_value "${varname}" "${!varname}"
+    log_ok "${varname} = ${!varname}"
+}
+
+# ==============================================================================
+# DISTRO-ERKENNUNG
+# ==============================================================================
+
+detect_distro() {
+    log_upall "Systemanalyse wird durchgefuehrt..."
+
+    if [[ -f /etc/os-release ]]; then
+        # shellcheck disable=SC1091
+        source /etc/os-release 2>/dev/null || true
+        DISTRO_ID="${ID:-unknown}"
+        DISTRO_NAME="${NAME:-Unbekannt}"
+        DISTRO_VERSION="${VERSION_ID:-}"
+    elif [[ -f /etc/lsb-release ]]; then
+        # shellcheck disable=SC1091
+        source /etc/lsb-release 2>/dev/null || true
+        DISTRO_ID="${DISTRIB_ID:-unknown}"
+        DISTRO_NAME="${DISTRIB_DESCRIPTION:-Unbekannt}"
+        DISTRO_VERSION="${DISTRIB_RELEASE:-}"
+    elif [[ -f /etc/redhat-release ]]; then
+        DISTRO_ID="rhel"
+        DISTRO_NAME=$(cat /etc/redhat-release)
+    elif [[ -f /etc/debian_version ]]; then
+        DISTRO_ID="debian"
+        DISTRO_NAME="Debian"
+        DISTRO_VERSION=$(cat /etc/debian_version)
+    elif [[ -f /etc/arch-release ]]; then
+        DISTRO_ID="arch"
+        DISTRO_NAME="Arch Linux"
+    elif [[ -f /etc/gentoo-release ]]; then
+        DISTRO_ID="gentoo"
+        DISTRO_NAME="Gentoo"
+    elif [[ -f /etc/SuSE-release ]]; then
+        DISTRO_ID="opensuse"
+        DISTRO_NAME="openSUSE"
+    else
+        DISTRO_ID="unknown"
+        DISTRO_NAME="Unbekannt"
+    fi
+
+    DISTRO_ID="${DISTRO_ID,,}"
+    detect_package_manager
+
+    log_upall "Erkannte Distribution: ${DISTRO_NAME} ${DISTRO_VERSION}"
+    log_upall "Paketmanager: ${PACKAGE_MANAGER}"
+}
+
+detect_package_manager() {
+    case "${DISTRO_ID}" in
+        debian|ubuntu|linuxmint|pop|elementary|kali|raspbian|zorin|neon)
+            if cmd_exists apt; then PACKAGE_MANAGER="apt"
+            elif cmd_exists apt-get; then PACKAGE_MANAGER="apt-get"
+            else PACKAGE_MANAGER="unknown"; fi
+            ;;
+        fedora)
+            if cmd_exists dnf; then PACKAGE_MANAGER="dnf"
+            elif cmd_exists yum; then PACKAGE_MANAGER="yum"
+            else PACKAGE_MANAGER="unknown"; fi
+            ;;
+        rhel|centos|almalinux|rocky)
+            if cmd_exists dnf; then PACKAGE_MANAGER="dnf"
+            elif cmd_exists yum; then PACKAGE_MANAGER="yum"
+            else PACKAGE_MANAGER="unknown"; fi
+            ;;
+        arch|manjaro|endeavouros|garuda|artix)
+            if cmd_exists pacman; then PACKAGE_MANAGER="pacman"
+            else PACKAGE_MANAGER="unknown"; fi
+            ;;
+        opensuse*|suse|sles)
+            if cmd_exists zypper; then PACKAGE_MANAGER="zypper"
+            else PACKAGE_MANAGER="unknown"; fi
+            ;;
+        gentoo)
+            if cmd_exists emerge; then PACKAGE_MANAGER="emerge"
+            else PACKAGE_MANAGER="unknown"; fi
+            ;;
+        *)
+            PACKAGE_MANAGER="unknown"
+            for pm in apt dnf pacman zypper emerge yum apt-get; do
+                if cmd_exists "${pm}"; then
+                    PACKAGE_MANAGER="${pm}"
+                    log_warn "Unbekannte Distro. Verwende: ${pm}"
+                    break
+                fi
+            done
+            ;;
+    esac
+}
+
+# ==============================================================================
+# UPDATE-FUNKTIONEN
+# ==============================================================================
+
+# --- APT (Debian/Ubuntu) ---
+update_apt() {
+    log_step "Paketlisten aktualisieren"
+    run_cmd "apt update" run_root apt-get update -qq
+
+    if [[ "${SECURITY_ONLY}" == "true" ]] && cmd_exists unattended-upgrade; then
+        log_step "Sicherheitsupdates installieren"
+        run_cmd "security updates" run_root unattended-upgrade -v
+    elif [[ "${DEBIAN_DIST_UPGRADE}" == "true" ]]; then
+        log_step "Pakete aktualisieren (dist-upgrade)"
+        run_cmd "apt dist-upgrade" run_root apt-get dist-upgrade -y
+    else
+        log_step "Pakete aktualisieren"
+        run_cmd "apt upgrade" run_root apt-get upgrade -y
+    fi
+
+    if [[ "${AUTOREMOVE}" == "true" ]]; then
+        log_step "Verwaiste Pakete entfernen"
+        run_cmd "apt autoremove" run_root apt-get autoremove -y
+    fi
+
+    if [[ "${CLEAN_CACHE}" == "true" ]]; then
+        log_step "APT-Cache bereinigen"
+        run_cmd "apt autoclean" run_root apt-get autoclean -y
+    fi
+}
+
+# --- DNF (Fedora) ---
+update_dnf() {
+    log_step "Updates pruefen"
+    run_root dnf check-update --quiet 2>/dev/null || true
+
+    log_step "Pakete aktualisieren"
+    local dnf_opts=(-y)
+    [[ "${SECURITY_ONLY}" == "true" ]] && dnf_opts+=(--security)
+    [[ "${FEDORA_ALLOW_DOWNGRADE}" == "true" ]] && dnf_opts+=(--allowerasing)
+    run_cmd "dnf upgrade" run_root dnf upgrade "${dnf_opts[@]}"
+
+    if [[ "${AUTOREMOVE}" == "true" ]]; then
+        log_step "Verwaiste Pakete entfernen"
+        run_cmd "dnf autoremove" run_root dnf autoremove -y
+    fi
+
+    if [[ "${CLEAN_CACHE}" == "true" ]]; then
+        log_step "DNF-Cache bereinigen"
+        run_cmd "dnf clean" run_root dnf clean all
+    fi
+}
+
+# --- YUM (RHEL/CentOS alt) ---
+update_yum() {
+    log_step "Pakete aktualisieren"
+    local yum_opts=(-y)
+    [[ "${SECURITY_ONLY}" == "true" ]] && yum_opts+=(--security)
+    run_cmd "yum update" run_root yum update "${yum_opts[@]}"
+
+    if [[ "${CLEAN_CACHE}" == "true" ]]; then
+        log_step "YUM-Cache bereinigen"
+        run_cmd "yum clean" run_root yum clean all
+    fi
+}
+
+# --- PACMAN (Arch) ---
+update_pacman() {
+    log_step "System aktualisieren (pacman -Syu)"
+    run_cmd "pacman sync" run_root pacman -Syu --noconfirm
+
+    # AUR-Helper
+    if [[ "${ARCH_AUR_HELPER}" != "none" ]]; then
+        local aur_cmd="${ARCH_AUR_HELPER}"
+        if cmd_exists "${aur_cmd}"; then
+            log_step "AUR-Pakete aktualisieren (${aur_cmd})"
+            # AUR-Helper NIE als root ausfuehren
+            if ! is_root; then
+                run_cmd "AUR update" "${aur_cmd}" -Syu --noconfirm
+            else
+                log_warn "AUR-Updates koennen nicht als Root ausgefuehrt werden."
+            fi
+        else
+            log_verbose "AUR-Helper '${aur_cmd}' nicht installiert."
+        fi
+    fi
+
+    if [[ "${CLEAN_CACHE}" == "true" ]]; then
+        log_step "Pacman-Cache bereinigen"
+        if cmd_exists paccache; then
+            run_cmd "paccache" run_root paccache -rk2
+        else
+            run_cmd "pacman cache" run_root pacman -Sc --noconfirm
+        fi
+    fi
+
+    # Verwaiste Pakete
+    if [[ "${AUTOREMOVE}" == "true" ]]; then
+        local orphans
+        orphans=$(pacman -Qdtq 2>/dev/null || true)
+        if [[ -n "${orphans}" ]]; then
+            log_step "Verwaiste Pakete entfernen"
+            echo "${orphans}" | run_root pacman -Rns --noconfirm - 2>/dev/null || \
+                log_verbose "Keine verwaisten Pakete oder Fehler beim Entfernen."
+        fi
+    fi
+}
+
+# --- ZYPPER (openSUSE) ---
+update_zypper() {
+    log_step "Repositories aktualisieren"
+    run_cmd "zypper refresh" run_root zypper --non-interactive refresh
+
+    if [[ "${OPENSUSE_DIST_UPGRADE}" == "true" ]]; then
+        log_step "Distributionsupgrade"
+        run_cmd "zypper dup" run_root zypper --non-interactive dist-upgrade
+    else
+        log_step "Pakete aktualisieren"
+        if [[ "${SECURITY_ONLY}" == "true" ]]; then
+            run_cmd "zypper patch" run_root zypper --non-interactive patch --category security
+        else
+            run_cmd "zypper update" run_root zypper --non-interactive update
+        fi
+    fi
+
+    if [[ "${CLEAN_CACHE}" == "true" ]]; then
+        log_step "Zypper-Cache bereinigen"
+        run_cmd "zypper clean" run_root zypper clean --all
+    fi
+}
+
+# --- EMERGE (Gentoo) ---
+update_emerge() {
+    log_step "Portage-Tree synchronisieren"
+    run_cmd "emerge sync" run_root emerge --sync
+
+    log_step "Pakete aktualisieren (@world)"
+    local emerge_opts=(--update --deep --newuse --with-bdeps=y)
+    [[ "${SECURITY_ONLY}" == "true" ]] && emerge_opts+=(--security)
+    emerge_opts+=("--jobs=${GENTOO_JOBS}")
+    run_cmd "emerge world" run_root emerge "${emerge_opts[@]}" @world
+
+    if [[ "${AUTOREMOVE}" == "true" ]]; then
+        log_step "Verwaiste Pakete entfernen"
+        run_cmd "emerge depclean" run_root emerge --depclean
+    fi
+
+    log_step "Konfigurationsdateien pruefen"
+    if cmd_exists etc-update; then
+        log_info "Bitte etc-update oder dispatch-conf manuell ausfuehren."
+    fi
+}
+
+# ==============================================================================
+# ZUSAETZLICHE UPDATE-QUELLEN
+# ==============================================================================
+
+update_flatpak() {
+    [[ "${UPDATE_FLATPAK}" != "true" ]] && return
+    cmd_exists flatpak || return
+
+    log_step "Flatpak-Pakete aktualisieren"
+    run_cmd "flatpak update" flatpak update -y --noninteractive 2>/dev/null || \
+        run_cmd "flatpak update (root)" run_root flatpak update -y --noninteractive 2>/dev/null || \
+        log_warn "Flatpak-Update fehlgeschlagen."
+}
+
+update_snap() {
+    [[ "${UPDATE_SNAP}" != "true" ]] && return
+    cmd_exists snap || return
+
+    log_step "Snap-Pakete aktualisieren"
+    run_cmd "snap refresh" run_root snap refresh 2>/dev/null || \
+        log_warn "Snap-Update fehlgeschlagen."
+}
+
+update_firmware() {
+    [[ "${UPDATE_FIRMWARE}" != "true" ]] && return
+    cmd_exists fwupdmgr || return
+
+    log_step "Firmware-Updates pruefen"
+    run_cmd "fwupd refresh" fwupdmgr refresh --force 2>/dev/null || true
+
+    log_step "Firmware-Updates installieren"
+    run_cmd "fwupd update" fwupdmgr update --no-reboot-check 2>/dev/null || \
+        log_info "Keine Firmware-Updates verfuegbar."
+}
+
+# ==============================================================================
+# SCHRITTE BERECHNEN
+# ==============================================================================
+
+calc_steps() {
+    STEPS_TOTAL=0
+    STEPS_CURRENT=0
+
+    case "${PACKAGE_MANAGER}" in
+        apt|apt-get)
+            (( STEPS_TOTAL += 2 ))
+            [[ "${AUTOREMOVE}" == "true" ]] && (( STEPS_TOTAL++ ))
+            [[ "${CLEAN_CACHE}" == "true" ]] && (( STEPS_TOTAL++ ))
+            ;;
+        dnf)
+            (( STEPS_TOTAL += 2 ))
+            [[ "${AUTOREMOVE}" == "true" ]] && (( STEPS_TOTAL++ ))
+            [[ "${CLEAN_CACHE}" == "true" ]] && (( STEPS_TOTAL++ ))
+            ;;
+        yum)
+            (( STEPS_TOTAL += 1 ))
+            [[ "${CLEAN_CACHE}" == "true" ]] && (( STEPS_TOTAL++ ))
+            ;;
+        pacman)
+            (( STEPS_TOTAL += 1 ))
+            [[ "${ARCH_AUR_HELPER}" != "none" ]] && cmd_exists "${ARCH_AUR_HELPER}" && (( STEPS_TOTAL++ ))
+            [[ "${CLEAN_CACHE}" == "true" ]] && (( STEPS_TOTAL++ ))
+            [[ "${AUTOREMOVE}" == "true" ]] && (( STEPS_TOTAL++ ))
+            ;;
+        zypper)
+            (( STEPS_TOTAL += 2 ))
+            [[ "${CLEAN_CACHE}" == "true" ]] && (( STEPS_TOTAL++ ))
+            ;;
+        emerge)
+            (( STEPS_TOTAL += 3 ))
+            [[ "${AUTOREMOVE}" == "true" ]] && (( STEPS_TOTAL++ ))
+            ;;
+    esac
+
+    [[ "${UPDATE_FLATPAK}" == "true" ]] && cmd_exists flatpak && (( STEPS_TOTAL++ )) || true
+    [[ "${UPDATE_SNAP}" == "true" ]] && cmd_exists snap && (( STEPS_TOTAL++ )) || true
+    [[ "${UPDATE_FIRMWARE}" == "true" ]] && cmd_exists fwupdmgr && (( STEPS_TOTAL += 2 )) || true
+}
+
+# ==============================================================================
+# BACKUP
+# ==============================================================================
+
+create_backup() {
+    [[ "${BACKUP_BEFORE_UPDATE}" != "true" ]] && return
+
+    if ! cmd_exists rsync; then
+        log_warn "rsync nicht installiert. Backup uebersprungen."
+        return
+    fi
+
+    local backup_dir="${HOME}/.local/share/UPALL/backups"
+    local backup_file="${backup_dir}/pkglist_$(date +%Y%m%d_%H%M%S).txt"
+    mkdir -p "${backup_dir}" 2>/dev/null || return
+
+    log_info "Paketliste sichern..."
+
+    case "${PACKAGE_MANAGER}" in
+        apt|apt-get)  dpkg --get-selections > "${backup_file}" 2>/dev/null ;;
+        dnf|yum)      rpm -qa --qf '%{NAME}\n' | sort > "${backup_file}" 2>/dev/null ;;
+        pacman)       pacman -Qqe > "${backup_file}" 2>/dev/null ;;
+        zypper)       rpm -qa --qf '%{NAME}\n' | sort > "${backup_file}" 2>/dev/null ;;
+        emerge)       qlist -I > "${backup_file}" 2>/dev/null || true ;;
+    esac
+
+    if [[ -s "${backup_file}" ]]; then
+        log_ok "Paketliste gesichert: ${backup_file}"
+    fi
+}
+
+# ==============================================================================
+# REBOOT-CHECK
+# ==============================================================================
+
+check_reboot() {
+    local needed=false
+
+    [[ -f /var/run/reboot-required ]] && needed=true
+
+    if cmd_exists needs-restarting; then
+        needs-restarting -r &>/dev/null || needed=true
+    fi
+
+    if [[ "${needed}" == "true" ]]; then
+        log_warn "Ein Neustart wird empfohlen."
+        if [[ "${REBOOT_AFTER}" == "true" ]]; then
+            log_warn "Auto-Reboot ist aktiviert. Neustart in 60 Sekunden..."
+            log_warn "Ctrl+C zum Abbrechen."
+            sleep 60
+            run_root reboot
+        fi
+    fi
+}
+
+# ==============================================================================
+# ZUSAMMENFASSUNG
+# ==============================================================================
+
+show_summary() {
+    echo ""
+    print_sep "-"
+    echo -e "${C_BOLD}  Zusammenfassung${C_RESET}"
+    print_sep "-"
+
+    local end_time duration
+    end_time=$(date +%s)
+    duration=$(( end_time - START_TIME ))
+    local mins=$(( duration / 60 ))
+    local secs=$(( duration % 60 ))
+
+    echo "[${SCRIPT_NAME}] Dauer:      ${mins}m ${secs}s"
+    echo "[${SCRIPT_NAME}] Schritte:   ${STEPS_CURRENT}/${STEPS_TOTAL}"
+    echo "[${SCRIPT_NAME}] Warnungen:  ${WARNINGS_COUNT}"
+    echo "[${SCRIPT_NAME}] Fehler:     ${ERRORS_COUNT}"
+
+    if [[ "${ERRORS_COUNT}" -eq 0 ]]; then
+        echo ""
+        log_ok "System ist aktuell."
+    else
+        echo ""
+        log_warn "Es gab ${ERRORS_COUNT} Fehler. Siehe Log: ${LOG_FILE}"
+    fi
+
+    print_sep "-"
+    echo ""
+}
+
+# ==============================================================================
+# SYSTEMINFO
+# ==============================================================================
+
+show_system_info() {
+    print_header
+    echo -e "${C_BOLD}  Systeminformationen${C_RESET}"
+    print_sep "-"
+
+    echo "[${SCRIPT_NAME}] Distribution: ${DISTRO_NAME} ${DISTRO_VERSION}"
+    echo "[${SCRIPT_NAME}] Paketmanager: ${PACKAGE_MANAGER}"
+    echo "[${SCRIPT_NAME}] Kernel:       $(uname -r)"
+    echo "[${SCRIPT_NAME}] Architektur:  $(uname -m)"
+    echo "[${SCRIPT_NAME}] Hostname:     $(hostname)"
+    echo "[${SCRIPT_NAME}] Benutzer:     $(whoami)"
+
+    if cmd_exists uptime; then
+        echo "[${SCRIPT_NAME}] Uptime:       $(uptime -p 2>/dev/null || uptime | sed 's/.*up /up /' | sed 's/,.*load.*//')"
+    fi
+
+    if cmd_exists free; then
+        local mem
+        mem=$(free -h 2>/dev/null | awk '/^Mem:/ {print $3 " / " $2}')
+        echo "[${SCRIPT_NAME}] RAM:          ${mem}"
+    fi
+
+    if cmd_exists df; then
+        local disk
+        disk=$(df -h / 2>/dev/null | awk 'NR==2 {print $3 " / " $2 " (" $5 ")"}')
+        echo "[${SCRIPT_NAME}] Disk (/):     ${disk}"
+    fi
+
+    # Zusaetzliche Paketquellen
+    echo ""
+    echo "[${SCRIPT_NAME}] Installierte Paketquellen:"
+    cmd_exists flatpak && echo "  - Flatpak $(flatpak --version 2>/dev/null || echo '')"
+    cmd_exists snap    && echo "  - Snap"
+    cmd_exists fwupdmgr && echo "  - fwupd (Firmware)"
+
+    # Paketanzahl
+    echo ""
+    echo -n "[${SCRIPT_NAME}] Pakete:       "
+    case "${PACKAGE_MANAGER}" in
+        apt|apt-get)  dpkg -l 2>/dev/null | grep -c "^ii" || echo "?" ;;
+        dnf|yum)      rpm -qa 2>/dev/null | wc -l || echo "?" ;;
+        pacman)       pacman -Q 2>/dev/null | wc -l || echo "?" ;;
+        zypper)       rpm -qa 2>/dev/null | wc -l || echo "?" ;;
+        emerge)       qlist -I 2>/dev/null | wc -l || echo "?" ;;
+        *)            echo "?" ;;
+    esac
+
+    print_sep "-"
+    echo ""
+}
+
+# ==============================================================================
+# SETUP-WIZARD
+# ==============================================================================
+
+run_setup() {
+    print_header
+    echo -e "${C_BOLD}  Ersteinrichtung${C_RESET}"
+    print_sep "-"
+    echo ""
+    log_info "Willkommen beim UPALL Setup-Wizard!"
+    echo ""
+
+    # Config erstellen
+    if [[ -f "${CONFIG_FILE}" ]]; then
+        log_info "Konfiguration existiert bereits: ${CONFIG_FILE}"
+        if ask_yn "Konfiguration zuruecksetzen?" "n"; then
+            write_default_config
+        fi
+    else
+        write_default_config
+    fi
+
+    echo ""
+
+    # Interaktive Konfiguration
+    log_info "Optionen konfigurieren:"
+    echo ""
+
+    if ask_yn "Kernel-Updates einschliessen?" "y"; then
+        update_config_value "UPDATE_KERNEL" "true"
+    else
+        update_config_value "UPDATE_KERNEL" "false"
+    fi
+
+    if ask_yn "Flatpak-Pakete aktualisieren?" "y"; then
+        update_config_value "UPDATE_FLATPAK" "true"
+    else
+        update_config_value "UPDATE_FLATPAK" "false"
+    fi
+
+    if ask_yn "Snap-Pakete aktualisieren?" "y"; then
+        update_config_value "UPDATE_SNAP" "true"
+    else
+        update_config_value "UPDATE_SNAP" "false"
+    fi
+
+    if ask_yn "Firmware-Updates aktivieren?" "n"; then
+        update_config_value "UPDATE_FIRMWARE" "true"
+    else
+        update_config_value "UPDATE_FIRMWARE" "false"
+    fi
+
+    if ask_yn "Automatische Bereinigung nach Updates?" "y"; then
+        update_config_value "AUTOREMOVE" "true"
+        update_config_value "CLEAN_CACHE" "true"
+    else
+        update_config_value "AUTOREMOVE" "false"
+        update_config_value "CLEAN_CACHE" "false"
+    fi
+
+    if ask_yn "Backup der Paketliste vor Updates?" "n"; then
+        update_config_value "BACKUP_BEFORE_UPDATE" "true"
+    else
+        update_config_value "BACKUP_BEFORE_UPDATE" "false"
+    fi
+
+    echo ""
+    echo -ne "${C_YELLOW}[${SCRIPT_NAME}] Log-Level (verbose/normal/quiet) [normal]: ${C_RESET}"
+    read -r ll
+    ll="${ll:-normal}"
+    case "${ll}" in
+        verbose|normal|quiet) update_config_value "LOG_LEVEL" "${ll}" ;;
+        *) update_config_value "LOG_LEVEL" "normal" ;;
+    esac
+
+    # Distro-spezifische Optionen
+    echo ""
+    case "${PACKAGE_MANAGER}" in
+        apt|apt-get)
+            if ask_yn "dist-upgrade statt upgrade verwenden? (empfohlen)" "y"; then
+                update_config_value "DEBIAN_DIST_UPGRADE" "true"
+            else
+                update_config_value "DEBIAN_DIST_UPGRADE" "false"
+            fi
+            ;;
+        pacman)
+            echo -ne "${C_YELLOW}[${SCRIPT_NAME}] AUR-Helper (paru/yay/none) [paru]: ${C_RESET}"
+            read -r aur
+            aur="${aur:-paru}"
+            update_config_value "ARCH_AUR_HELPER" "${aur}"
+            ;;
+        zypper)
+            if ask_yn "Distributionsupgrade bei Updates?" "n"; then
+                update_config_value "OPENSUSE_DIST_UPGRADE" "true"
+            fi
+            ;;
+    esac
+
+    echo ""
+    print_sep "-"
+    log_ok "Setup abgeschlossen!"
+    log_info "Konfiguration: ${CONFIG_FILE}"
+    log_info "Starte UPALL mit: UPALL"
+    log_info "Nerd Mode mit:    UPALL --nerd"
+    print_sep "-"
+    echo ""
+}
+
+# ==============================================================================
+# NERD MODE
+# ==============================================================================
+
+nerd_header() {
+    clear 2>/dev/null || true
+    print_sep "="
+    echo -e "${C_BOLD}${C_CYAN}  UPALL v${SCRIPT_VERSION} - Nerd Mode${C_RESET}"
+    echo -e "  ${DISTRO_NAME} ${DISTRO_VERSION} | ${PACKAGE_MANAGER}"
+    print_sep "="
+    echo ""
+}
+
+nerd_menu() {
+    while true; do
+        nerd_header
+        echo -e "${C_BOLD}  HAUPTMENUE${C_RESET}"
+        print_sep "-"
+        echo "  [1] Vollstaendiges Update"
+        echo "  [2] Selektive Update-Optionen"
+        echo "  [3] Bereinigung"
+        echo "  [4] Systeminformationen"
+        echo "  [5] Konfiguration bearbeiten"
+        echo "  [6] Konfiguration anzeigen"
+        echo "  [7] Log-Dateien"
+        echo "  [8] Dry-Run (Simulation)"
+        echo "  [9] Ueber UPALL"
+        echo "  [0] Beenden"
+        print_sep "-"
+
+        echo -ne "${C_YELLOW}  Auswahl [0-9]: ${C_RESET}"
+        read -r ch
+        echo ""
+
+        case "${ch}" in
+            1) nerd_full_update ;;
+            2) nerd_selective ;;
+            3) nerd_cleanup ;;
+            4) show_system_info; read -rp "  [Enter]" ;;
+            5) nerd_edit_config ;;
+            6) nerd_show_config ;;
+            7) nerd_logs ;;
+            8) nerd_dryrun ;;
+            9) nerd_about ;;
+            0) log_info "Auf Wiedersehen."; exit 0 ;;
+            *) log_warn "Ungueltige Auswahl." ; sleep 1 ;;
+        esac
+    done
+}
+
+nerd_full_update() {
+    nerd_header
+    echo -e "${C_BOLD}  VOLLSTAENDIGES UPDATE${C_RESET}"
+    print_sep "-"
+    echo ""
+    echo "  Distribution:   ${DISTRO_NAME}"
+    echo "  Paketmanager:   ${PACKAGE_MANAGER}"
+    echo "  Kernel-Updates: ${UPDATE_KERNEL}"
+    echo "  Flatpak:        ${UPDATE_FLATPAK}"
+    echo "  Snap:           ${UPDATE_SNAP}"
+    echo "  Firmware:       ${UPDATE_FIRMWARE}"
+    echo "  Bereinigung:    ${AUTOREMOVE}"
+    echo ""
+
+    if ask_yn "Update jetzt starten?" "y"; then
+        echo ""
+        START_TIME=$(date +%s)
+        create_backup
+        calc_steps
+        run_updates
+        show_summary
+        check_reboot
+    fi
+
+    echo ""
+    read -rp "  [Enter]"
+}
+
+nerd_selective() {
+    while true; do
+        nerd_header
+        echo -e "${C_BOLD}  SELEKTIVE OPTIONEN${C_RESET}"
+        print_sep "-"
+
+        local s1 s2 s3 s4 s5 s6
+        [[ "${UPDATE_KERNEL}" == "true" ]]   && s1="AN " || s1="AUS"
+        [[ "${UPDATE_FLATPAK}" == "true" ]]  && s2="AN " || s2="AUS"
+        [[ "${UPDATE_SNAP}" == "true" ]]     && s3="AN " || s3="AUS"
+        [[ "${UPDATE_FIRMWARE}" == "true" ]] && s4="AN " || s4="AUS"
+        [[ "${SECURITY_ONLY}" == "true" ]]   && s5="AN " || s5="AUS"
+        [[ "${AUTOREMOVE}" == "true" ]]      && s6="AN " || s6="AUS"
+
+        echo "  [1] Kernel-Updates        [${s1}]"
+        echo "  [2] Flatpak               [${s2}]"
+        echo "  [3] Snap                  [${s3}]"
+        echo "  [4] Firmware              [${s4}]"
+        echo "  [5] Nur Sicherheit        [${s5}]"
+        echo "  [6] Auto-Remove           [${s6}]"
+        echo "  [0] Zurueck"
+        print_sep "-"
+
+        echo -ne "${C_YELLOW}  Auswahl [0-6]: ${C_RESET}"
+        read -r ch
+
+        case "${ch}" in
+            1) toggle_var "UPDATE_KERNEL" ;;
+            2) toggle_var "UPDATE_FLATPAK" ;;
+            3) toggle_var "UPDATE_SNAP" ;;
+            4) toggle_var "UPDATE_FIRMWARE" ;;
+            5) toggle_var "SECURITY_ONLY" ;;
+            6) toggle_var "AUTOREMOVE" ;;
+            0) return ;;
+            *) log_warn "Ungueltig." ; sleep 1 ;;
+        esac
+    done
+}
+
+nerd_cleanup() {
+    nerd_header
+    echo -e "${C_BOLD}  MANUELLE BEREINIGUNG${C_RESET}"
+    print_sep "-"
+    echo ""
+
+    if ask_yn "Bereinigung jetzt ausfuehren?" "y"; then
+        case "${PACKAGE_MANAGER}" in
+            apt|apt-get)
+                run_cmd "autoremove" run_root apt-get autoremove -y
+                run_cmd "autoclean" run_root apt-get autoclean
+                ;;
+            dnf)
+                run_cmd "autoremove" run_root dnf autoremove -y
+                run_cmd "clean" run_root dnf clean all
+                ;;
+            pacman)
+                if cmd_exists paccache; then
+                    run_cmd "paccache" run_root paccache -rk2
+                fi
+                local orph
+                orph=$(pacman -Qdtq 2>/dev/null || true)
+                if [[ -n "${orph}" ]]; then
+                    echo "${orph}" | run_root pacman -Rns --noconfirm - 2>/dev/null || true
+                fi
+                ;;
+            zypper)
+                run_cmd "clean" run_root zypper clean --all
+                ;;
+            emerge)
+                run_cmd "depclean" run_root emerge --depclean
+                ;;
+        esac
+
+        # Flatpak unused
+        if cmd_exists flatpak; then
+            flatpak uninstall --unused -y 2>/dev/null || true
+            log_ok "Flatpak: Ungenutzte Runtimes entfernt."
+        fi
+
+        echo ""
+        log_ok "Bereinigung abgeschlossen."
+    fi
+
+    echo ""
+    read -rp "  [Enter]"
+}
+
+nerd_edit_config() {
+    ensure_config_dir
+    [[ ! -f "${CONFIG_FILE}" ]] && write_default_config
+
+    local ed=""
+    for e in nano vim vi; do
+        cmd_exists "${e}" && { ed="${e}"; break; }
+    done
+
+    if [[ -n "${ed}" ]]; then
+        ${ed} "${CONFIG_FILE}"
+        load_config
+        log_ok "Konfiguration neu geladen."
+    else
+        log_error "Kein Editor gefunden."
+    fi
+    sleep 1
+}
+
+nerd_show_config() {
+    nerd_header
+    echo -e "${C_BOLD}  AKTUELLE KONFIGURATION${C_RESET}"
+    print_sep "-"
+
+    if [[ -f "${CONFIG_FILE}" ]]; then
+        while IFS= read -r line; do
+            echo "  ${line}"
+        done < "${CONFIG_FILE}"
+    else
+        echo "  Keine Konfigurationsdatei vorhanden."
+    fi
+
+    echo ""
+    print_sep "-"
+    read -rp "  [Enter]"
+}
+
+nerd_logs() {
+    nerd_header
+    echo -e "${C_BOLD}  LOG-DATEIEN${C_RESET}"
+    print_sep "-"
+    echo ""
+
+    if [[ ! -d "${LOG_DIR}" ]]; then
+        log_info "Kein Log-Verzeichnis vorhanden."
+        read -rp "  [Enter]"
+        return
+    fi
+
+    local -a logs=()
+    while IFS= read -r f; do
+        logs+=("$f")
+    done < <(find "${LOG_DIR}" -name "upall_*.log" -printf "%f\n" 2>/dev/null | sort -r | head -20)
+
+    if [[ ${#logs[@]} -eq 0 ]]; then
+        log_info "Keine Log-Dateien vorhanden."
+        read -rp "  [Enter]"
+        return
+    fi
+
+    for i in "${!logs[@]}"; do
+        echo "  [$((i+1))] ${logs[$i]}"
+    done
+    echo "  [0] Zurueck"
+    echo ""
+
+    echo -ne "${C_YELLOW}  Auswahl: ${C_RESET}"
+    read -r ch
+
+    [[ "${ch}" == "0" ]] && return
+
+    if [[ "${ch}" =~ ^[0-9]+$ ]] && (( ch > 0 && ch <= ${#logs[@]} )); then
+        local f="${LOG_DIR}/${logs[$((ch-1))]}"
+        if cmd_exists less; then
+            less "${f}"
+        else
+            cat "${f}"
+            read -rp "  [Enter]"
+        fi
+    fi
+}
+
+nerd_dryrun() {
+    nerd_header
+    echo -e "${C_BOLD}  DRY-RUN SIMULATION${C_RESET}"
+    print_sep "-"
+    echo ""
+    log_info "Keine Aenderungen werden vorgenommen."
+    echo ""
+
+    DRY_RUN=true
+    START_TIME=$(date +%s)
+    calc_steps
+    run_updates
+    show_summary
+    DRY_RUN=false
+
+    read -rp "  [Enter]"
+}
+
+nerd_about() {
+    nerd_header
+    echo -e "${C_BOLD}  UEBER UPALL${C_RESET}"
+    print_sep "-"
+    echo ""
+    echo "  UPALL - Universal Linux Updater"
+    echo "  Version: ${SCRIPT_VERSION}"
+    echo ""
+    echo "  Unterstuetzte Distributionen:"
+    echo "    - Debian, Ubuntu, Linux Mint, Pop!_OS"
+    echo "    - Fedora, RHEL, CentOS, AlmaLinux, Rocky"
+    echo "    - Arch Linux, Manjaro, EndeavourOS"
+    echo "    - openSUSE, SLES"
+    echo "    - Gentoo"
+    echo ""
+    echo "  Unterstuetzte Paketmanager:"
+    echo "    - apt / apt-get"
+    echo "    - dnf / yum"
+    echo "    - pacman (+ AUR-Helper)"
+    echo "    - zypper"
+    echo "    - emerge"
+    echo ""
+    echo "  Zusaetzlich:"
+    echo "    - Flatpak"
+    echo "    - Snap"
+    echo "    - fwupd (Firmware)"
+    echo ""
+    echo "  Konfiguration: ${CONFIG_FILE}"
+    echo "  Log-Dateien:   ${LOG_DIR}"
+    echo ""
+    print_sep "-"
+    read -rp "  [Enter]"
+}
+
+# ==============================================================================
+# HAUPT-UPDATE-LOGIK
+# ==============================================================================
+
+run_updates() {
+    print_sep "-"
+    log_upall "Update-Prozess wird gestartet..."
+    print_sep "-"
+    echo ""
+
+    case "${PACKAGE_MANAGER}" in
+        apt|apt-get)  update_apt ;;
+        dnf)          update_dnf ;;
+        yum)          update_yum ;;
+        pacman)       update_pacman ;;
+        zypper)       update_zypper ;;
+        emerge)       update_emerge ;;
+        unknown)
+            log_error "Kein unterstuetzter Paketmanager. Abbruch."
+            return 1
+            ;;
+        *)
+            log_error "Unbekannt: ${PACKAGE_MANAGER}"
+            return 1
+            ;;
+    esac
+
+    update_flatpak
+    update_snap
+    update_firmware
+}
+
+# ==============================================================================
+# HILFE & VERSION
+# ==============================================================================
+
+show_help() {
+    cat << HILFE_ENDE
+
+${SCRIPT_NAME} v${SCRIPT_VERSION} - Universal Linux Updater
+
+NUTZUNG:
+    UPALL [OPTION]
+
+OPTIONEN:
+    (keine)       Normales vollstaendiges Update
+    --nerd        Interaktiver Nerd Mode mit Menue
+    --setup       Ersteinrichtung / Setup-Wizard
+    --dry-run     Simulation (keine Aenderungen)
+    --quiet       Stille Ausfuehrung (nur Fehler)
+    --force       Keine Rueckfragen
+    --info        Systeminformationen anzeigen
+    --version     Version anzeigen
+    --help        Diese Hilfe anzeigen
+
+KONFIGURATION:
+    ${CONFIG_FILE}
+
+LOG-DATEIEN:
+    ${LOG_DIR}
+
+BEISPIELE:
+    UPALL                  Volles System-Update
+    UPALL --nerd           Erweitertes Menue
+    UPALL --dry-run        Simulation
+    UPALL --quiet --force  Automatisch, still
+
+HILFE_ENDE
+}
+
+show_version() {
+    echo "${SCRIPT_NAME} v${SCRIPT_VERSION}"
+}
+
+# ==============================================================================
+# ARGUMENTE VERARBEITEN
+# ==============================================================================
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --nerd)     NERD_MODE=true ;;
+            --setup)    SETUP_MODE=true ;;
+            --dry-run)  DRY_RUN=true ;;
+            --quiet)    QUIET_MODE=true; LOG_LEVEL="quiet" ;;
+            --force)    FORCE_MODE=true ;;
+            --info)     SHOW_INFO=true ;;
+            --version)  show_version; exit 0 ;;
+            --help|-h)  show_help; exit 0 ;;
+            *)
+                log_error "Unbekannte Option: $1"
+                echo "Verwende --help fuer Hilfe."
+                exit 1
+                ;;
+        esac
+        shift
+    done
+}
+
+# ==============================================================================
+# MAIN
+# ==============================================================================
+
+main() {
+    # Bash-Version pruefen
+    if (( BASH_VERSINFO[0] < 4 )); then
+        echo "[${SCRIPT_NAME}] [ERROR] Bash 4.0+ erforderlich (aktuell: ${BASH_VERSION})" >&2
+        exit 1
+    fi
+
+    setup_colors
+    parse_args "$@"
+    setup_logging
+    setup_traps
+    acquire_lock
+
+    # Distro erkennen
+    detect_distro
+
+    # Konfiguration laden
+    load_config
+
+    START_TIME=$(date +%s)
+
+    # Modus-Auswahl
+    if [[ "${SETUP_MODE}" == "true" ]]; then
+        run_setup
+        exit 0
+    fi
+
+    if [[ "${SHOW_INFO}" == "true" ]]; then
+        show_system_info
+        exit 0
+    fi
+
+    if [[ "${NERD_MODE}" == "true" ]]; then
+        nerd_menu
+        exit 0
+    fi
+
+    # --- Standard-Modus: Vollstaendiges Update ---
+    print_header
+
+    if [[ "${PACKAGE_MANAGER}" == "unknown" ]]; then
+        log_error "Kein unterstuetzter Paketmanager gefunden. Abbruch."
+        exit 1
+    fi
+
+    # Root-Check
+    if ! is_root && ! cmd_exists sudo; then
+        log_error "Root-Rechte oder sudo erforderlich."
+        exit 1
+    fi
+
+    # Sudo vorab authentifizieren
+    if ! is_root && cmd_exists sudo; then
+        log_info "Root-Rechte werden angefordert..."
+        if ! sudo -v; then
+            log_error "sudo-Authentifizierung fehlgeschlagen."
+            exit 1
+        fi
+    fi
+
+    if [[ "${DRY_RUN}" == "true" ]]; then
+        log_info "DRY-RUN Modus aktiv. Keine Aenderungen."
+        echo ""
+    fi
+
+    create_backup
+    calc_steps
+    run_updates
+    show_summary
+    check_reboot
+
+    exit "${ERRORS_COUNT}"
+}
+
+# Script starten
+main "$@"
