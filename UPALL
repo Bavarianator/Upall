@@ -154,9 +154,9 @@ is_root() { [[ "${EUID:-$(id -u)}" -eq 0 ]]; }
 
 run_root() {
     if is_root; then
-        "$@"
+        exec "$@"
     elif cmd_exists sudo; then
-        sudo "$@"
+        exec sudo "$@"
     else
         log_error "Root-Rechte erforderlich, sudo nicht verfuegbar."
         return 1
@@ -193,12 +193,14 @@ run_cmd() {
         return 0
     fi
 
+    local exit_code=0
     if "$@"; then
         log_verbose "${desc} erfolgreich."
         return 0
     else
-        log_warn "${desc} fehlgeschlagen (Exit: $?)."
-        return 1
+        exit_code=$?
+        log_warn "${desc} fehlgeschlagen (Exit: ${exit_code})."
+        return "${exit_code}"
     fi
 }
 
@@ -498,7 +500,7 @@ update_apt() {
 # --- DNF (Fedora) ---
 update_dnf() {
     log_step "Updates pruefen"
-    run_root dnf check-update --quiet 2>/dev/null || true
+    run_cmd "dnf check-update" run_root dnf check-update --quiet 2>/dev/null || true
 
     log_step "Pakete aktualisieren"
     local dnf_opts=(-y)
@@ -566,8 +568,9 @@ update_pacman() {
         orphans=$(pacman -Qdtq 2>/dev/null || true)
         if [[ -n "${orphans}" ]]; then
             log_step "Verwaiste Pakete entfernen"
-            echo "${orphans}" | run_root pacman -Rns --noconfirm - 2>/dev/null || \
+            if ! (echo "${orphans}" | run_root pacman -Rns --noconfirm - 2>/dev/null); then
                 log_verbose "Keine verwaisten Pakete oder Fehler beim Entfernen."
+            fi
         fi
     fi
 }
@@ -746,7 +749,7 @@ check_reboot() {
             log_warn "Auto-Reboot ist aktiviert. Neustart in 60 Sekunden..."
             log_warn "Ctrl+C zum Abbrechen."
             sleep 60
-            run_root reboot
+            run_cmd "Reboot" run_root reboot
         fi
     fi
 }
@@ -1087,7 +1090,7 @@ nerd_cleanup() {
                 local orph
                 orph=$(pacman -Qdtq 2>/dev/null || true)
                 if [[ -n "${orph}" ]]; then
-                    echo "${orph}" | run_root pacman -Rns --noconfirm - 2>/dev/null || true
+                    (echo "${orph}" | run_root pacman -Rns --noconfirm -) 2>/dev/null || true
                 fi
                 ;;
             zypper)
